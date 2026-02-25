@@ -1,6 +1,5 @@
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
 
 const RNNOISE_URL: &str =
     "https://github.com/xiph/rnnoise/releases/download/v0.2/rnnoise-0.2.tar.gz";
@@ -18,35 +17,85 @@ fn main() {
         archive.unpack(&out_dir).expect("failed to unpack");
     }
 
-    Command::new("./configure")
-        .arg(format!("--prefix={}", out_dir.display()))
-        .arg("--enable-x86-rtcd")
-        .arg("--enable-static")
-        .current_dir(&rnnoise_dir)
-        .status()
-        .unwrap();
+    let src_dir = rnnoise_dir.join("src");
+    let include_dir = rnnoise_dir.join("include");
 
-    Command::new("make")
-        .current_dir(&rnnoise_dir)
-        .status()
-        .unwrap();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let is_x86 = target_arch == "x86" || target_arch == "x86_64";
+    let is_msvc = target_env == "msvc";
 
-    Command::new("make")
-        .arg("install")
-        .current_dir(&rnnoise_dir)
-        .status()
-        .unwrap();
+    let mut build = cc::Build::new();
+    build
+        .include(&include_dir)
+        .include(&src_dir)
+        .define("RNNOISE_BUILD", None)
+        .define("DISABLE_DEBUG_FLOAT", "1")
+        .file(src_dir.join("denoise.c"))
+        .file(src_dir.join("rnn.c"))
+        .file(src_dir.join("pitch.c"))
+        .file(src_dir.join("kiss_fft.c"))
+        .file(src_dir.join("celt_lpc.c"))
+        .file(src_dir.join("nnet.c"))
+        .file(src_dir.join("nnet_default.c"))
+        .file(src_dir.join("parse_lpcnet_weights.c"))
+        .file(src_dir.join("rnnoise_data.c"))
+        .file(src_dir.join("rnnoise_tables.c"));
 
-    println!("cargo:rustc-link-lib=static=rnnoise");
-    println!("cargo:rustc-link-search=native={}/lib", out_dir.display());
+    if is_x86 {
+        build
+            .define("RNN_ENABLE_X86_RTCD", "1")
+            .file(src_dir.join("x86/x86_dnn_map.c"))
+            .file(src_dir.join("x86/x86cpu.c"));
+        if !is_msvc {
+            build.define("CPU_INFO_BY_ASM", "1");
+        }
+    }
+
+    build.compile("rnnoise");
+
+    if is_x86 {
+        // SSE4.1 sources need -msse4.1 on GCC/Clang; MSVC enables SSE4.1 by default on x64
+        let mut sse41 = cc::Build::new();
+        sse41
+            .include(&include_dir)
+            .include(&src_dir)
+            .define("RNNOISE_BUILD", None)
+            .define("DISABLE_DEBUG_FLOAT", "1")
+            .define("RNN_ENABLE_X86_RTCD", "1")
+            .file(src_dir.join("x86/nnet_sse4_1.c"));
+        if !is_msvc {
+            sse41
+                .define("CPU_INFO_BY_ASM", "1")
+                .flag("-msse4.1");
+        }
+        sse41.compile("rnnoise_sse41");
+
+        // AVX2 sources need -mavx -mfma -mavx2 on GCC/Clang, /arch:AVX2 on MSVC
+        let mut avx2 = cc::Build::new();
+        avx2.include(&include_dir)
+            .include(&src_dir)
+            .define("RNNOISE_BUILD", None)
+            .define("DISABLE_DEBUG_FLOAT", "1")
+            .define("RNN_ENABLE_X86_RTCD", "1")
+            .file(src_dir.join("x86/nnet_avx2.c"));
+        if !is_msvc {
+            avx2.define("CPU_INFO_BY_ASM", "1")
+                .flag("-mavx")
+                .flag("-mfma")
+                .flag("-mavx2");
+        } else {
+            avx2.flag("/arch:AVX2");
+        }
+        avx2.compile("rnnoise_avx2");
+    }
 
     let bindings = bindgen::Builder::default()
-        .header(format!("{}/include/rnnoise.h", out_dir.display()))
+        .header(include_dir.join("rnnoise.h").to_str().unwrap())
         .generate()
         .expect("Unable to generate bindings");
 
-    let bindings_path = out_dir.join("bindings.rs");
     bindings
-        .write_to_file(&bindings_path)
+        .write_to_file(out_dir.join("bindings.rs"))
         .expect("Couldn't write bindings");
 }
